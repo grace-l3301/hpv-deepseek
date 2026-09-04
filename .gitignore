@@ -1,0 +1,21 @@
+# This repo only tracks a specific, curated subset of files from this project
+# directory. Everything is ignored by default; each path below is explicitly
+# un-ignored one directory level at a time (a required pattern for git -- a
+# bare "!" rule for a deeply nested file has no effect if an ancestor
+# directory is already ignored).
+
+# Ignore everything at the root by default.
+/*
+!/.gitignore
+
+# hpv_deepseek/reads_coverage/ -- allow traversal down to the tracked files.
+!/hpv_deepseek/
+/hpv_deepseek/*
+!/hpv_deepseek/reads_coverage/
+/hpv_deepseek/reads_coverage/*
+!/hpv_deepseek/reads_coverage/ssc_and_dsc.py
+!/hpv_deepseek/reads_coverage/reads_coverage.py
+!/hpv_deepseek/reads_coverage/doc/
+/hpv_deepseek/reads_coverage/doc/*
+!/hpv_deepseek/reads_coverage/doc/ssc_and_dsc.md
+!/hpv_deepseek/reads_coverage/doc/reads_coverage.md
