@@ -9,23 +9,26 @@ back into a single unmapped, UMI-tagged BAM at the path the caller expects.
 
 Invoked by ssc_and_dsc.py in place of a single blind, fixed-length ExtractUmisFromBam call.
 
+Catalog loading and Levenshtein matching live in umi_matching.py, shared with
+whitelist_index_hopping_umis.py, which whitelists already-extracted RX tags against the
+same catalog as the index-hopping detection whitelisting step.
+
 Author: Samuli Eldfors
 """
 
 from __future__ import annotations
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 import argparse
 import subprocess
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 
 import pysam
-import Levenshtein
 
-DEFAULT_MAX_EDIT_DISTANCE = 1
+from umi_matching import DEFAULT_MAX_EDIT_DISTANCE, UNCLASSIFIED, UmiMatch, load_umi_catalogs, match_umi
+
 DEFAULT_THREE_NT_TRIM_LENGTH = 4  # 3-nt UMI + 1-base T-overhang; no padding assumed
 DEFAULT_FIVE_NT_TRIM_LENGTH = 6  # 5-nt UMI + 1-base T-overhang
 
@@ -33,60 +36,6 @@ SPECIES_LENGTH = {"3nt": 3, "5nt": 5}
 CLASSIFIED_BUCKETS = ("3nt_3nt", "3nt_5nt", "5nt_3nt", "5nt_5nt")
 REJECT_BUCKET = "unclassified"
 ALL_BUCKETS = CLASSIFIED_BUCKETS + (REJECT_BUCKET,)
-
-
-@dataclass(frozen=True)
-class UmiMatch:
-    species: str  # "3nt", "5nt", or "unclassified"
-    umi: str | None
-    edit_distance: int | None
-
-
-UNCLASSIFIED = UmiMatch("unclassified", None, None)
-
-
-def load_umi_catalogs(catalog_path: Path) -> tuple[frozenset[str], frozenset[str]]:
-    """Parse the KAPA UMI catalog (tab-separated: index, bare UMI, full sequence with
-    T-overhang; '#'-prefixed lines are comments). Returns (three_nt_catalog, five_nt_catalog)
-    of bare UMI strings, partitioned by length."""
-    three_nt = set()
-    five_nt = set()
-    with open(catalog_path) as handle:
-        for line in handle:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            fields = line.split("\t")
-            if len(fields) < 2:
-                continue
-            umi = fields[1].strip()
-            if len(umi) == 3:
-                three_nt.add(umi)
-            elif len(umi) == 5:
-                five_nt.add(umi)
-            else:
-                raise ValueError(f"{catalog_path}: UMI {umi!r} has length {len(umi)}, expected 3 or 5")
-    if not three_nt or not five_nt:
-        raise ValueError(f"{catalog_path}: expected both 3-nt and 5-nt UMI catalog entries")
-    return frozenset(three_nt), frozenset(five_nt)
-
-
-def _best_fuzzy_match(prefix: str, catalog: frozenset[str], max_edit_distance: int) -> tuple[str | None, int | None]:
-    """Return the catalog entry closest to prefix by Levenshtein distance, or (None, None)
-    if nothing is within max_edit_distance. Iterates sorted(catalog) so that a genuine tie
-    between two equidistant catalog entries (possible with this small a catalog) resolves
-    deterministically to the lexicographically-first entry, rather than depending on set
-    iteration order."""
-    best_umi = None
-    best_distance = None
-    for umi in sorted(catalog):
-        distance = Levenshtein.distance(prefix, umi)
-        if best_distance is None or distance < best_distance:
-            best_distance = distance
-            best_umi = umi
-    if best_distance is not None and best_distance <= max_edit_distance:
-        return best_umi, best_distance
-    return None, None
 
 
 def classify_leading_sequence(
@@ -111,14 +60,14 @@ def classify_leading_sequence(
         if prefix5 in five_nt_catalog:
             return UmiMatch("5nt", prefix5, 0)
 
-    umi, distance = _best_fuzzy_match(prefix3, three_nt_catalog, max_edit_distance)
-    if umi is not None:
-        return UmiMatch("3nt", umi, distance)
+    match3 = match_umi(prefix3, three_nt_catalog, max_edit_distance)
+    if match3.accepted:
+        return UmiMatch("3nt", match3.umi, match3.edit_distance)
 
     if len(seq) >= 5:
-        umi, distance = _best_fuzzy_match(seq[:5], five_nt_catalog, max_edit_distance)
-        if umi is not None:
-            return UmiMatch("5nt", umi, distance)
+        match5 = match_umi(seq[:5], five_nt_catalog, max_edit_distance)
+        if match5.accepted:
+            return UmiMatch("5nt", match5.umi, match5.edit_distance)
 
     return UNCLASSIFIED
 

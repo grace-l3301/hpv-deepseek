@@ -34,6 +34,24 @@ DEFAULT_SSC_FAMILY_SIZE_TAG = "cD"
 DEFAULT_UMI_EXTRACT_SCRIPT = str(Path(__file__).resolve().parent / "extract_umis_by_species.py")
 DEFAULT_UMI_CATALOG_FILE = str(Path(__file__).resolve().parent / "doc" / "KAPA_Universal_UMI_sequences.txt")
 DEFAULT_THREE_NT_TRIM_LENGTH = 4
+DEFAULT_UMI_WHITELIST_SCRIPT = str(Path(__file__).resolve().parent / "whitelist_index_hopping_umis.py")
+DEFAULT_UMI_WHITELIST_MAX_EDIT_DISTANCE = 1
+DEFAULT_UMI_WHITELIST_CONTIG_FILTER = r"(?i)hpv"
+DEFAULT_INDEX_HOPPING_AUDIT_SCRIPT = str(Path(__file__).resolve().parent / "audit_index_hopping.py")
+DEFAULT_INDEX_HOPPING_MIN_FLOOR = 10
+DEFAULT_INDEX_HOPPING_SNR_THRESHOLD = 0.01
+DEFAULT_INDEX_HOPPING_CPUS = 4
+DEFAULT_INDEX_HOPPING_MEM = "16G"
+DEFAULT_INDEX_HOPPING_TIME = "04:00:00"
+
+INDEX_HOPPING_MANIFEST_COLUMNS = (
+    "sample_id",
+    "ssc_bam",
+    "ssc_filtered_bam",
+    "ssc_umi_whitelist_report",
+    "dsc_bam",
+    "dsc_umi_whitelist_report",
+)
 
 NUCLEUS_MODULES = {
     "Java": "Java/17.0.15",
@@ -174,6 +192,68 @@ def parse_args():
             f"species. Default: {DEFAULT_THREE_NT_TRIM_LENGTH} (3-nt UMI + 1-base T-overhang, no padding)."
         ),
     )
+    parser.add_argument(
+        "--skip-umi-whitelisting",
+        action="store_true",
+        help=(
+            "Do not run the index-hopping detection whitelisting step (classifies each SSC/DSC "
+            "read's RX UMI tag against the KAPA catalog by Levenshtein distance)."
+        ),
+    )
+    parser.add_argument(
+        "--umi-whitelist-script",
+        default=DEFAULT_UMI_WHITELIST_SCRIPT,
+        help="Full path to the UMI whitelisting script (whitelist_index_hopping_umis.py).",
+    )
+    parser.add_argument(
+        "--umi-whitelist-max-edit-distance",
+        type=int,
+        default=DEFAULT_UMI_WHITELIST_MAX_EDIT_DISTANCE,
+        help=f"Maximum Levenshtein distance accepted as a 'near' catalog match during UMI whitelisting. Default: {DEFAULT_UMI_WHITELIST_MAX_EDIT_DISTANCE}.",
+    )
+    parser.add_argument(
+        "--umi-whitelist-contig-filter",
+        default=DEFAULT_UMI_WHITELIST_CONTIG_FILTER,
+        help=(
+            "Regex restricting UMI whitelisting to matching contigs (empty string disables "
+            f"filtering). Default: {DEFAULT_UMI_WHITELIST_CONTIG_FILTER!r}."
+        ),
+    )
+    parser.add_argument(
+        "--skip-index-hopping-audit",
+        action="store_true",
+        help=(
+            "Do not run the cross-sample index-hopping audit (floor/SNR decontamination + "
+            "clean BAMs) after this run's SSC/DSC jobs complete. Implied by --skip-umi-whitelisting, "
+            "since the audit reads the per-sample whitelist reports that step produces. Only "
+            "triggered by whole-run invocations (no --sample-id)."
+        ),
+    )
+    parser.add_argument(
+        "--force-index-hopping-audit",
+        action="store_true",
+        help="Resubmit the index-hopping audit job even if no new sample jobs were submitted this invocation and a prior report already exists.",
+    )
+    parser.add_argument(
+        "--index-hopping-audit-script",
+        default=DEFAULT_INDEX_HOPPING_AUDIT_SCRIPT,
+        help="Full path to the cross-sample index-hopping audit script (audit_index_hopping.py).",
+    )
+    parser.add_argument(
+        "--index-hopping-min-floor",
+        type=int,
+        default=DEFAULT_INDEX_HOPPING_MIN_FLOOR,
+        help=f"Minimum genotype read total below which a non-source sample's reads are always blacklisted as index-hopping. Default: {DEFAULT_INDEX_HOPPING_MIN_FLOOR}.",
+    )
+    parser.add_argument(
+        "--index-hopping-snr-threshold",
+        type=float,
+        default=DEFAULT_INDEX_HOPPING_SNR_THRESHOLD,
+        help=f"Minimum ratio of a non-source sample's genotype total to the source sample's total to rescue it as a plausible co-infection rather than index hopping. Default: {DEFAULT_INDEX_HOPPING_SNR_THRESHOLD}.",
+    )
+    parser.add_argument("--index-hopping-cpus", type=int, default=DEFAULT_INDEX_HOPPING_CPUS, help=f"CPUs for the index-hopping audit SLURM job. Default: {DEFAULT_INDEX_HOPPING_CPUS}.")
+    parser.add_argument("--index-hopping-mem", default=DEFAULT_INDEX_HOPPING_MEM, help=f"SLURM memory for the index-hopping audit job. Default: {DEFAULT_INDEX_HOPPING_MEM}.")
+    parser.add_argument("--index-hopping-time", default=DEFAULT_INDEX_HOPPING_TIME, help=f"SLURM time limit for the index-hopping audit job. Default: {DEFAULT_INDEX_HOPPING_TIME}.")
     parser.add_argument("--cpus", type=int, default=DEFAULT_CPUS, help=f"CPUs for BWA and SLURM. Default: {DEFAULT_CPUS}.")
     parser.add_argument("--java-memory", default=DEFAULT_JVM_OPTIONS, help=f"Java JVM memory option. Default: {DEFAULT_JVM_OPTIONS}.")
     parser.add_argument("--partition", default=DEFAULT_SLURM_PARTITION, help=f"SLURM partition. Default: {DEFAULT_SLURM_PARTITION}.")
@@ -260,6 +340,12 @@ def validate_args(args):
         raise ValueError(
             "--three-nt-trim-length must be >= 4 (3-nt UMI plus at least a 1-base T-overhang skip)."
         )
+    if args.index_hopping_min_floor < 0:
+        raise ValueError("--index-hopping-min-floor must be >= 0.")
+    if not 0.0 <= args.index_hopping_snr_threshold <= 1.0:
+        raise ValueError("--index-hopping-snr-threshold must be between 0.0 and 1.0.")
+    if args.index_hopping_cpus < 1:
+        raise ValueError("--index-hopping-cpus must be >= 1.")
 
     run_dir = build_run_dir(args)
     if not args.sample_id or not args.skip_input_check:
@@ -267,12 +353,17 @@ def validate_args(args):
             raise FileNotFoundError(f"run directory not found: {run_dir}")
 
     if not args.skip_input_check:
-        for label, path_text in (
+        required_paths = [
             ("reference genome", args.reference_genome),
             ("fgbio jar", args.fgbio_jar),
             ("UMI extraction script", args.umi_extract_script),
             ("UMI catalog file", args.umi_catalog_file),
-        ):
+        ]
+        if not args.skip_umi_whitelisting:
+            required_paths.append(("UMI whitelisting script", args.umi_whitelist_script))
+        if not args.skip_index_hopping_audit:
+            required_paths.append(("index-hopping audit script", args.index_hopping_audit_script))
+        for label, path_text in required_paths:
             if not Path(path_text).expanduser().exists():
                 raise FileNotFoundError(f"{label} not found: {path_text}")
 
@@ -403,11 +494,13 @@ def build_paths(args):
     paths["dsc_bam"] = paths["output_dsc_dir"] / f"{sample_id}_umi_dedup_sorted_DSC.bam"
     paths["dsc_bai"] = Path(str(paths["dsc_bam"]) + ".bai")
     paths["dsc_coverage"] = paths["output_dsc_dir"] / f"{sample_id}.DSC_coverage.txt"
+    paths["ssc_umi_whitelist_report"] = paths["output_ssc_dir"] / f"{sample_id}.SSC_umi_whitelist.tsv"
+    paths["dsc_umi_whitelist_report"] = paths["output_dsc_dir"] / f"{sample_id}.DSC_umi_whitelist.tsv"
     return paths
 
 
-def expected_completion_files(paths):
-    return (
+def expected_completion_files(paths, args):
+    files = [
         paths["ssc_bam"],
         paths["ssc_bai"],
         paths["ssc_coverage"],
@@ -417,11 +510,15 @@ def expected_completion_files(paths):
         paths["dsc_bam"],
         paths["dsc_bai"],
         paths["dsc_coverage"],
-    )
+    ]
+    if not args.skip_umi_whitelisting:
+        files.append(paths["ssc_umi_whitelist_report"])
+        files.append(paths["dsc_umi_whitelist_report"])
+    return tuple(files)
 
 
-def outputs_are_complete(paths):
-    return all(path.is_file() and path.stat().st_size > 0 for path in expected_completion_files(paths))
+def outputs_are_complete(paths, args):
+    return all(path.is_file() and path.stat().st_size > 0 for path in expected_completion_files(paths, args))
 
 
 def create_directories(paths):
@@ -434,6 +531,7 @@ def write_analysis_log(args, paths):
     fgbio_jar = resolve_path(args.fgbio_jar)
     umi_extract_script = resolve_path(args.umi_extract_script)
     umi_catalog_file = resolve_path(args.umi_catalog_file)
+    umi_whitelist_script = None if args.skip_umi_whitelisting else resolve_path(args.umi_whitelist_script)
 
     with paths["analysis_log"].open("w") as log_file:
         log_file.write(f"Script name: ssc_and_dsc-v{__version__}.py\n")
@@ -456,6 +554,10 @@ def write_analysis_log(args, paths):
         log_file.write(f"  SSC family-size tag: {args.ssc_family_size_tag}\n")
         log_file.write(f"  SSC family-size filter: {args.ssc_family_size_tag} > {args.ssc_min_family_size}\n")
         log_file.write(f"  3-nt UMI species trim length: {args.three_nt_trim_length}\n")
+        log_file.write(f"  UMI whitelisting (index-hopping detection): {'disabled' if args.skip_umi_whitelisting else 'enabled'}\n")
+        if not args.skip_umi_whitelisting:
+            log_file.write(f"  UMI whitelist max edit distance: {args.umi_whitelist_max_edit_distance}\n")
+            log_file.write(f"  UMI whitelist contig filter: {args.umi_whitelist_contig_filter!r}\n")
         log_file.write("\nInput files:\n")
         log_file.write(f"  R1 FASTQ: {paths['r1_fastq']}\n")
         log_file.write(f"  R2 FASTQ: {paths['r2_fastq']}\n")
@@ -463,8 +565,10 @@ def write_analysis_log(args, paths):
         log_file.write(f"  fgbio jar: {fgbio_jar}\n")
         log_file.write(f"  UMI extraction script: {umi_extract_script}\n")
         log_file.write(f"  UMI catalog file: {umi_catalog_file}\n")
+        if umi_whitelist_script is not None:
+            log_file.write(f"  UMI whitelisting script: {umi_whitelist_script}\n")
         log_file.write("\nGenerated files:\n")
-        for label in (
+        generated_file_labels = [
             "job_script",
             "analysis_log",
             "slurm_stdout",
@@ -482,7 +586,10 @@ def write_analysis_log(args, paths):
             "dsc_bam",
             "dsc_bai",
             "dsc_coverage",
-        ):
+        ]
+        if not args.skip_umi_whitelisting:
+            generated_file_labels.extend(["ssc_umi_whitelist_report", "dsc_umi_whitelist_report"])
+        for label in generated_file_labels:
             log_file.write(f"  {label}: {paths[label]}\n")
         log_file.write("\nNucleus modules:\n")
         for tool, module_name in NUCLEUS_MODULES.items():
@@ -804,6 +911,7 @@ samtools coverage "$$SSC_FILTERED_BAM" \
     echo "  Filtered read count: $$(samtools view -c "$$SSC_FILTERED_BAM")"
 } >> "$$ANALYSIS_LOG"
 
+${umi_whitelist_ssc_block}
 rm -rf "$$TEMP_SSC_DIR"
 
 log_step "Collecting duplex metrics"
@@ -871,9 +979,45 @@ samtools coverage "$$OUTPUT_DSC_DIR/$${SAMPLE_ID}_umi_dedup_sorted_DSC.bam" \
     | awk 'BEGIN {OFS="\t"} NR==1 {print $$1,$$4,$$6} NR>1 {print $$1,$$4,$$6}' \
     > "$$OUTPUT_DSC_DIR/$${SAMPLE_ID}.DSC_coverage.txt"
 
+${umi_whitelist_dsc_block}
 rm -rf "$$TEMP_DSC_DIR"
 log_step "SSC/DSC analysis complete"
 ''')
+
+    if args.skip_umi_whitelisting:
+        umi_whitelist_ssc_block = 'log_step "Skipping SSC UMI whitelisting (--skip-umi-whitelisting)"\n'
+        umi_whitelist_dsc_block = 'log_step "Skipping DSC UMI whitelisting (--skip-umi-whitelisting)"\n'
+    else:
+        umi_whitelist_script_quoted = shell_quote(resolve_path(args.umi_whitelist_script))
+        umi_catalog_file_quoted = shell_quote(resolve_path(args.umi_catalog_file))
+        max_edit_distance_quoted = shell_quote(str(args.umi_whitelist_max_edit_distance))
+        contig_filter_quoted = shell_quote(args.umi_whitelist_contig_filter)
+        sample_id_quoted = shell_quote(args.sample_id)
+
+        umi_whitelist_ssc_block = (
+            'log_step "Whitelisting SSC UMIs against KAPA catalog (index-hopping detection)"\n'
+            f"python3 {umi_whitelist_script_quoted} \\\n"
+            f'    --input-bam {shell_quote(paths["ssc_bam"])} \\\n'
+            f"    --sample-id {sample_id_quoted} \\\n"
+            "    --bam-kind SSC \\\n"
+            f"    --umi-catalog-file {umi_catalog_file_quoted} \\\n"
+            f"    --max-edit-distance {max_edit_distance_quoted} \\\n"
+            f"    --contig-filter-regex {contig_filter_quoted} \\\n"
+            f'    --output-report {shell_quote(paths["ssc_umi_whitelist_report"])} \\\n'
+            '    | tee -a "$ANALYSIS_LOG"\n'
+        )
+        umi_whitelist_dsc_block = (
+            'log_step "Whitelisting DSC UMIs against KAPA catalog (index-hopping detection)"\n'
+            f"python3 {umi_whitelist_script_quoted} \\\n"
+            f'    --input-bam {shell_quote(paths["dsc_bam"])} \\\n'
+            f"    --sample-id {sample_id_quoted} \\\n"
+            "    --bam-kind DSC \\\n"
+            f"    --umi-catalog-file {umi_catalog_file_quoted} \\\n"
+            f"    --max-edit-distance {max_edit_distance_quoted} \\\n"
+            f"    --contig-filter-regex {contig_filter_quoted} \\\n"
+            f'    --output-report {shell_quote(paths["dsc_umi_whitelist_report"])} \\\n'
+            '    | tee -a "$ANALYSIS_LOG"\n'
+        )
 
     substitutions = {
         "sample_id": args.sample_id,
@@ -907,6 +1051,8 @@ log_step "SSC/DSC analysis complete"
         "ssc_filtered_bam": shell_quote(paths["ssc_filtered_bam"]),
         "ssc_min_family_size": str(args.ssc_min_family_size),
         "ssc_family_size_tag_quoted": shell_quote(args.ssc_family_size_tag),
+        "umi_whitelist_ssc_block": umi_whitelist_ssc_block,
+        "umi_whitelist_dsc_block": umi_whitelist_dsc_block,
     }
     return template.substitute(substitutions)
 
@@ -918,6 +1064,9 @@ def write_job_script(job_script_path, content):
 
 
 def submit_job(job_script_path):
+    """Submit a job script with sbatch and return its numeric SLURM job ID. Raises if sbatch
+    fails or its stdout doesn't parse, rather than silently returning nothing -- callers rely
+    on a real job ID to chain the index-hopping audit's --dependency=afterany."""
     result = subprocess.run(
         ["sbatch", str(job_script_path)],
         stdout=subprocess.PIPE,
@@ -931,10 +1080,226 @@ def submit_job(job_script_path):
         print(result.stderr.strip())
     if result.returncode != 0:
         raise RuntimeError(f"sbatch failed with exit code {result.returncode}")
+    parts = result.stdout.strip().split()
+    if not (parts and parts[-1].isdigit()):
+        raise RuntimeError(f"sbatch succeeded but no job ID could be parsed from stdout: {result.stdout.strip()!r}")
+    return parts[-1]
+
+
+def discover_all_run_samples(args):
+    """Discover every sample in the run directory, ignoring this invocation's --sample-id /
+    --library-id filters. Used to build the index-hopping audit's manifest, which must cover
+    the whole run regardless of which subset this invocation happens to be (re)processing."""
+    whole_run_args = argparse.Namespace(**vars(args))
+    whole_run_args.sample_id = None
+    whole_run_args.library_ids = []
+    sample_jobs, _skipped_inputs = discover_sample_jobs(whole_run_args)
+    return sample_jobs
+
+
+def build_index_hopping_manifest_rows(args, sample_jobs):
+    rows = []
+    for sample_job in sample_jobs:
+        sample_args = build_sample_args(args, sample_job)
+        paths = build_paths(sample_args)
+        rows.append(
+            {
+                "sample_id": sample_job.sample_id,
+                "ssc_bam": str(paths["ssc_bam"]),
+                "ssc_filtered_bam": str(paths["ssc_filtered_bam"]),
+                "ssc_umi_whitelist_report": str(paths["ssc_umi_whitelist_report"]),
+                "dsc_bam": str(paths["dsc_bam"]),
+                "dsc_umi_whitelist_report": str(paths["dsc_umi_whitelist_report"]),
+            }
+        )
+    return rows
+
+
+def write_index_hopping_manifest(manifest_path, rows):
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    with manifest_path.open("w") as handle:
+        handle.write("\t".join(INDEX_HOPPING_MANIFEST_COLUMNS) + "\n")
+        for row in rows:
+            handle.write("\t".join(row[column] for column in INDEX_HOPPING_MANIFEST_COLUMNS) + "\n")
+
+
+def build_index_hopping_paths(args):
+    run_dir = build_run_dir(args)
+    ihop_dir = run_dir / "index_hopping"
+    job_dir = ihop_dir / "job_scripts"
+    log_dir = ihop_dir / "logs"
+    results_dir = ihop_dir / "results"
+    return {
+        "ihop_dir": ihop_dir,
+        "job_dir": job_dir,
+        "log_dir": log_dir,
+        "results_dir": results_dir,
+        "manifest": ihop_dir / "sample_bam_manifest.tsv",
+        "job_script": job_dir / "job_index_hopping_audit.sh",
+        "slurm_stdout": log_dir / "index_hopping_audit_%j.out",
+        "slurm_stderr": log_dir / "index_hopping_audit_%j.err",
+        "ssc_report": results_dir / "IHOP_Final_Report.SSC.tsv",
+        "dsc_report": results_dir / "IHOP_Final_Report.DSC.tsv",
+    }
+
+
+def create_index_hopping_directories(ihop_paths):
+    for key in ("ihop_dir", "job_dir", "log_dir", "results_dir"):
+        ihop_paths[key].mkdir(parents=True, exist_ok=True)
+
+
+def build_index_hopping_job_script(args, ihop_paths):
+    template = Template(r'''#!/bin/bash
+#SBATCH --job-name=index_hopping_audit_${run_id}
+#SBATCH --nodes=1
+#SBATCH --cpus-per-task=${cpus}
+#SBATCH --mem=${mem}
+#SBATCH --time=${time}
+#SBATCH --partition=${partition}
+#SBATCH --output=${slurm_stdout}
+#SBATCH --error=${slurm_stderr}
+
+set -euo pipefail
+
+log_step() {
+    echo "[$$(date '+%Y-%m-%d %H:%M:%S')] $$*"
+}
+
+log_step "Loading Nucleus modules"
+if command -v module >/dev/null 2>&1; then
+    module purge || true
+    module load Miniforge3/24.11.3-0
+else
+    echo "FATAL: module command is not available. Run this job on ERIS Nucleus." >&2
+    exit 1
+fi
+
+log_step "Initializing conda"
+if [ -n "$${EBROOTMINIFORGE3:-}" ] && [ -f "$$EBROOTMINIFORGE3/etc/profile.d/conda.sh" ]; then
+    . "$$EBROOTMINIFORGE3/etc/profile.d/conda.sh"
+else
+    echo "FATAL: conda.sh not found after loading Miniforge3." >&2
+    exit 1
+fi
+
+conda activate fastp-nucleus || {
+    echo "FATAL: conda activate fastp-nucleus failed." >&2
+    exit 1
+}
+
+mkdir -p ${results_dir}
+
+log_step "Auditing SSC BAMs for index hopping"
+python3 ${audit_script} \
+    --manifest ${manifest} \
+    --bam-kind SSC \
+    --min-floor ${min_floor} \
+    --snr-threshold ${snr_threshold} \
+    --output-dir ${results_dir}
+
+log_step "Auditing DSC BAMs for index hopping"
+python3 ${audit_script} \
+    --manifest ${manifest} \
+    --bam-kind DSC \
+    --min-floor ${min_floor} \
+    --snr-threshold ${snr_threshold} \
+    --output-dir ${results_dir}
+
+log_step "Index-hopping audit complete"
+''')
+    substitutions = {
+        "run_id": args.run_id,
+        "cpus": str(args.index_hopping_cpus),
+        "mem": args.index_hopping_mem,
+        "time": args.index_hopping_time,
+        "partition": args.partition,
+        "slurm_stdout": shell_quote(ihop_paths["slurm_stdout"]),
+        "slurm_stderr": shell_quote(ihop_paths["slurm_stderr"]),
+        "results_dir": shell_quote(ihop_paths["results_dir"]),
+        "audit_script": shell_quote(resolve_path(args.index_hopping_audit_script)),
+        "manifest": shell_quote(ihop_paths["manifest"]),
+        "min_floor": shell_quote(str(args.index_hopping_min_floor)),
+        "snr_threshold": shell_quote(str(args.index_hopping_snr_threshold)),
+    }
+    return template.substitute(substitutions)
+
+
+def submit_index_hopping_audit(args, job_ids):
+    """Build and submit the cross-sample index-hopping audit job, gated on a whole-run sample
+    discovery (see discover_all_run_samples) so it always covers the full run directory
+    regardless of this invocation's --library-id filter. Chains on --dependency=afterany the
+    job IDs this invocation itself submitted; samples completed in an earlier invocation are
+    already on disk and need no dependency, but samples belonging to a *different*,
+    not-yet-submitted library will simply be skipped (with a warning) by the audit script if
+    their BAMs don't exist yet when it runs -- re-run this tool once every library has been
+    submitted to get a complete audit."""
+    sample_jobs = discover_all_run_samples(args)
+    if len(sample_jobs) < 2:
+        print(f"Skipping index-hopping audit: fewer than 2 samples discovered in {build_run_dir(args)}.")
+        return
+
+    ihop_paths = build_index_hopping_paths(args)
+
+    if (
+        not job_ids
+        and not args.force
+        and not args.force_index_hopping_audit
+        and ihop_paths["ssc_report"].is_file()
+        and ihop_paths["dsc_report"].is_file()
+    ):
+        print(
+            "Skipping index-hopping audit: no new sample jobs were submitted this invocation and a "
+            f"prior report already exists ({ihop_paths['results_dir']}). Use --force-index-hopping-audit "
+            "to re-run anyway."
+        )
+        return
+
+    create_index_hopping_directories(ihop_paths)
+    manifest_rows = build_index_hopping_manifest_rows(args, sample_jobs)
+    write_index_hopping_manifest(ihop_paths["manifest"], manifest_rows)
+    print(f"Created index-hopping audit manifest: {ihop_paths['manifest']} ({len(manifest_rows)} sample(s))")
+
+    job_script_content = build_index_hopping_job_script(args, ihop_paths)
+    write_job_script(ihop_paths["job_script"], job_script_content)
+    print(f"Created index-hopping audit job script: {ihop_paths['job_script']}")
+
+    if args.dry_run:
+        print(
+            f"Dry run: would submit index-hopping audit job"
+            + (f" with dependency on {len(job_ids)} sample job(s) from this invocation" if job_ids else "")
+            + "."
+        )
+        return
+
+    if job_ids:
+        result = subprocess.run(
+            ["sbatch", f"--dependency=afterany:{':'.join(job_ids)}", str(ihop_paths["job_script"])],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+    else:
+        result = subprocess.run(
+            ["sbatch", str(ihop_paths["job_script"])],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+    if result.stdout:
+        print(result.stdout.strip())
+    if result.stderr:
+        print(result.stderr.strip())
+    if result.returncode != 0:
+        raise RuntimeError(f"index-hopping audit sbatch failed with exit code {result.returncode}")
 
 
 def main():
     args = parse_args()
+    if args.skip_umi_whitelisting and not args.skip_index_hopping_audit:
+        print("Note: --skip-umi-whitelisting implies --skip-index-hopping-audit (the audit reads the whitelist reports).")
+        args.skip_index_hopping_audit = True
     validate_args(args)
     sample_jobs, skipped_inputs = discover_sample_jobs(args)
 
@@ -951,7 +1316,7 @@ def main():
         validate_sample_inputs(args, sample_job)
         sample_args = build_sample_args(args, sample_job)
         paths = build_paths(sample_args)
-        if not args.force and outputs_are_complete(paths):
+        if not args.force and outputs_are_complete(paths, sample_args):
             skipped_complete.append(sample_job.sample_id)
             continue
         pending_jobs.append((sample_job, sample_args, paths))
@@ -959,25 +1324,44 @@ def main():
     print(f"Discovered {len(sample_jobs)} sample(s) with paired FASTQs in {build_run_dir(args)}")
     if skipped_complete:
         print(f"Skipping {len(skipped_complete)} completed sample(s): {', '.join(skipped_complete)}")
+
+    job_ids = []
     if not pending_jobs:
         print("No SSC/DSC jobs need to be created or submitted.")
+    else:
+        print(f"Preparing {len(pending_jobs)} SSC/DSC job(s): {', '.join(job[0].sample_id for job in pending_jobs)}")
+        if args.dry_run:
+            print("Dry run enabled: job scripts and logs will be created, but sbatch submission is skipped.")
+
+        for sample_job, sample_args, paths in pending_jobs:
+            create_directories(paths)
+            write_analysis_log(sample_args, paths)
+            job_script_content = build_job_script(sample_args, paths)
+            write_job_script(paths["job_script"], job_script_content)
+
+            print(f"Created job script for {sample_job.sample_id}: {paths['job_script']}")
+            print(f"Created analysis log for {sample_job.sample_id}: {paths['analysis_log']}")
+
+            if args.dry_run:
+                job_ids.append(f"DRY_{sample_job.sample_id}")
+            else:
+                job_ids.append(submit_job(paths["job_script"]))
+
+    if args.sample_id:
+        if not args.skip_index_hopping_audit:
+            print(
+                "Note: the index-hopping audit only runs for whole-run invocations (no --sample-id). "
+                "Re-run without --sample-id to refresh the run's audit after this sample's outputs change."
+            )
         return
 
-    print(f"Preparing {len(pending_jobs)} SSC/DSC job(s): {', '.join(job[0].sample_id for job in pending_jobs)}")
-    if args.dry_run:
-        print("Dry run enabled: job scripts and logs will be created, but sbatch submission is skipped.")
+    if args.skip_index_hopping_audit:
+        return
 
-    for sample_job, sample_args, paths in pending_jobs:
-        create_directories(paths)
-        write_analysis_log(sample_args, paths)
-        job_script_content = build_job_script(sample_args, paths)
-        write_job_script(paths["job_script"], job_script_content)
-
-        print(f"Created job script for {sample_job.sample_id}: {paths['job_script']}")
-        print(f"Created analysis log for {sample_job.sample_id}: {paths['analysis_log']}")
-
-        if not args.dry_run:
-            submit_job(paths["job_script"])
+    # Under --dry-run, job_ids holds "DRY_<sample_id>" stand-ins rather than real sbatch IDs;
+    # submit_index_hopping_audit() checks args.dry_run itself and only uses job_ids' truthiness
+    # (were there any pending jobs at all) before returning without calling sbatch.
+    submit_index_hopping_audit(args, job_ids)
 
 
 if __name__ == "__main__":

@@ -22,3 +22,6 @@
 !/hpv_deepseek/reads_coverage/doc/reads_coverage.md
 !/hpv_deepseek/reads_coverage/doc/KAPA_Universal_UMI_sequences.txt
 !/hpv_deepseek/reads_coverage/doc/KAPA_Universal_UMI_sequences.list.txt
+!/hpv_deepseek/reads_coverage/umi_matching.py
+!/hpv_deepseek/reads_coverage/whitelist_index_hopping_umis.py
+!/hpv_deepseek/reads_coverage/audit_index_hopping.py
