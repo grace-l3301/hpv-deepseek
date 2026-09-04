@@ -1,0 +1,25 @@
+# KAPA Universal UMI Adapter — Unique Molecular Identifier (UMI) sequences
+# Source: KAPA_Universal_UMI_Adapter.pdf (Roche Sequencing Solutions), page 4, "Sequences of Unique
+# Molecular Identifiers used by KAPA Universal Adapter with UMI"
+#
+# Each UMI is a 5-nt sequence followed by the 3' T-overhang of the KAPA Universal Adapter (denoted
+# "*T" in the source document). The T-overhang is part of the adapter ligation junction, not the UMI
+# itself, so it is listed separately below.
+#
+# Columns: index  umi_5nt  full_sequence_with_T_overhang
+1	AATCC	AATCCT
+2	AGAAG	AGAAGT
+3	CCAGG	CCAGGT
+4	CTTAC	CTTACT
+5	GAAGC	GAAGCT
+6	GGTCG	GGTCGT
+7	TCTAG	TCTAGT
+8	TTACC	TTACCT
+9	ACC	ACCT
+10	ATG	ATGT
+11	CAG	CAGT
+12	CGC	CGCT
+13	GCG	GCGT
+14	GTC	GTCT
+15	TAC	TACT
+16	TGG	TGGT
