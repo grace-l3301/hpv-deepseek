@@ -15,6 +15,7 @@
 /hpv_deepseek/reads_coverage/*
 !/hpv_deepseek/reads_coverage/ssc_and_dsc.py
 !/hpv_deepseek/reads_coverage/reads_coverage.py
+!/hpv_deepseek/reads_coverage/extract_umis_by_species.py
 !/hpv_deepseek/reads_coverage/doc/
 /hpv_deepseek/reads_coverage/doc/*
 !/hpv_deepseek/reads_coverage/doc/ssc_and_dsc.md
