@@ -25,3 +25,12 @@
 !/hpv_deepseek/reads_coverage/umi_matching.py
 !/hpv_deepseek/reads_coverage/whitelist_index_hopping_umis.py
 !/hpv_deepseek/reads_coverage/audit_index_hopping.py
+
+# --- merge-routing-duplex-ihop -------------------------------------------------
+!/hpv_deepseek/reads_coverage/hpv_call_rule.awk
+!/hpv_deepseek/reads_coverage/region_files/
+/hpv_deepseek/reads_coverage/region_files/*
+!/hpv_deepseek/reads_coverage/region_files/human_refs.txt
+!/hpv_deepseek/reads_coverage/region_files/hpv_refs.txt
+!/hpv_deepseek/reads_coverage/region_files/all_contigs.txt
+!/hpv_deepseek/reads_coverage/region_files/PIK3CA_GAPDH.bed

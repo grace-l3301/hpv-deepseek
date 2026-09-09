@@ -74,6 +74,24 @@ def load_umi_catalogs(catalog_path: Path) -> tuple[frozenset[str], frozenset[str
     return frozenset(three_nt), frozenset(five_nt)
 
 
+OVERHANG_BASE = "T"
+
+
+def match_umi_with_overhang(leading: str, catalog: frozenset[str],
+                            max_edit_distance: int) -> CatalogMatch:
+    """Match `leading` against `catalog` scoring the UMI and the T-overhang together."""
+    best_umi = None
+    best_distance = None
+    for umi in sorted(catalog):
+        full = umi + OVERHANG_BASE
+        distance = Levenshtein.distance(leading[:len(full)], full)
+        if best_distance is None or distance < best_distance:
+            best_distance = distance
+            best_umi = umi
+    accepted = best_distance is not None and best_distance <= max_edit_distance
+    return CatalogMatch(best_umi, best_distance, accepted)
+
+
 def match_umi(query: str, catalog: frozenset[str], max_edit_distance: int) -> CatalogMatch:
     """Return the catalog entry closest to query by Levenshtein distance, always including
     the true nearest distance (even when it exceeds max_edit_distance) so callers that need

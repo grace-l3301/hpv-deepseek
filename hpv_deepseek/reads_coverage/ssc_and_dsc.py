@@ -33,6 +33,7 @@ DEFAULT_SSC_MIN_FAMILY_SIZE = 5
 DEFAULT_SSC_FAMILY_SIZE_TAG = "cD"
 DEFAULT_UMI_EXTRACT_SCRIPT = str(Path(__file__).resolve().parent / "extract_umis_by_species.py")
 DEFAULT_UMI_CATALOG_FILE = str(Path(__file__).resolve().parent / "doc" / "KAPA_Universal_UMI_sequences.txt")
+DEFAULT_MIN_READ_LENGTH = 75  # fastp -l. Was hardcoded; see --min-read-length.
 DEFAULT_THREE_NT_TRIM_LENGTH = 4
 DEFAULT_UMI_WHITELIST_SCRIPT = str(Path(__file__).resolve().parent / "whitelist_index_hopping_umis.py")
 DEFAULT_UMI_WHITELIST_MAX_EDIT_DISTANCE = 1
@@ -182,6 +183,41 @@ def parse_args():
         "--umi-catalog-file",
         default=DEFAULT_UMI_CATALOG_FILE,
         help="Full path to the KAPA Universal UMI catalog file (bare UMI + full-sequence columns).",
+    )
+    parser.add_argument(
+        "--skip-species-split",
+        action="store_true",
+        help="Skip splitting the final BAMs into human / HPV / chimeric and the target-panel slice.",
+    )
+    parser.add_argument(
+        "--human-refs",
+        default=str(Path(__file__).resolve().parent / "region_files" / "human_refs.txt"),
+        help="One human contig name per line. MUST match the reference's .fai -- a mismatch "
+             "makes the split silently stop partitioning rather than erroring.",
+    )
+    parser.add_argument(
+        "--hpv-refs",
+        default=str(Path(__file__).resolve().parent / "region_files" / "hpv_refs.txt"),
+        help="One HPV contig name per line. Same .fai requirement as --human-refs.",
+    )
+    parser.add_argument(
+        "--target-bed",
+        default=str(Path(__file__).resolve().parent / "region_files" / "PIK3CA_GAPDH.bed"),
+        help="BED of panel targets; the human split is sliced to it.",
+    )
+    parser.add_argument(
+        "--target-name",
+        default="PIK3CA_GAPDH",
+        help="Filename tag for the target slice.",
+    )
+    parser.add_argument(
+        "--min-read-length",
+        type=int,
+        default=DEFAULT_MIN_READ_LENGTH,
+        help=(
+            "Discard reads shorter than this after adapter trimming (fastp -l). 0 disables "
+            f"length filtering. Default: {DEFAULT_MIN_READ_LENGTH}."
+        ),
     )
     parser.add_argument(
         "--three-nt-trim-length",
@@ -624,6 +660,12 @@ REFERENCE_GENOME=${reference_genome}
 FGBIO_JAR=${fgbio_jar}
 UMI_EXTRACT_SCRIPT=${umi_extract_script}
 UMI_CATALOG_FILE=${umi_catalog_file}
+MIN_READ_LENGTH=${min_read_length}
+DO_SPECIES_SPLIT=${do_species_split}
+HUMAN_REFS=${human_refs}
+HPV_REFS=${hpv_refs}
+TARGET_BED=${target_bed}
+TARGET_NAME=${target_name}
 THREE_NT_TRIM_LENGTH=${three_nt_trim_length}
 JVM_OPTIONS=${jvm_options}
 CPU=${cpus}
@@ -760,7 +802,7 @@ fastp \
     -o "$$TEMP_DIR/$${SAMPLE_ID}_umi_extracted_trimmed_R1.fastq" \
     -I "$$TEMP_DIR/$${SAMPLE_ID}_umi_extracted_R2.fastq" \
     -O "$$TEMP_DIR/$${SAMPLE_ID}_umi_extracted_trimmed_R2.fastq" \
-    -g -W 5 -q 20 -u 40 -3 -l 75 -c \
+    -g -W 5 -q 20 -u 40 -3 -l $$MIN_READ_LENGTH -c \
     -j "$$FASTP_JSON" \
     -h "$$FASTP_HTML" \
     &> "$$FASTP_LOG"
@@ -868,9 +910,55 @@ gatk --java-options "$$JVM_OPTIONS" MergeBamAlignment \
     --ALIGNER_PROPER_PAIR_FLAGS true \
     --CLIP_OVERLAPPING_READS false
 
+# Split a coordinate-sorted BAM into human / HPV / chimeric, then slice the human part
+# to the panel. "chimeric" is per-QNAME, not per-record: keep a QNAME only if it has at
+# least one alignment on a human contig AND at least one on an HPV contig, which is the
+# integration signature. Taking `uniq -d` on QNAME alone flags every read pair, since all
+# data is paired-end, and returns essentially the whole BAM.
+split_species(){
+    local B=$$1 OD=$$2 TAG=$$3
+    [ "$$DO_SPECIES_SPLIT" = "1" ] || return 0
+    [ -s "$$B" ] || { log "split $$TAG: source BAM missing, skipped"; return 0; }
+    [ -f "$$B.bai" ] || samtools index "$$B"
+
+    local H=$$OD/$${SAMPLE_ID}_$${TAG}.human.bam
+    local P=$$OD/$${SAMPLE_ID}_$${TAG}.hpv.bam
+    local C=$$OD/$${SAMPLE_ID}_$${TAG}.chimeric.bam
+
+    log_step "Splitting $$TAG BAM into human / HPV / chimeric"
+    samtools view -bh "$$B" $$(cat "$$HUMAN_REFS") -o "$$H"; samtools index "$$H"
+    samtools view -bh "$$B" $$(cat "$$HPV_REFS")   -o "$$P"; samtools index "$$P"
+
+    local ids=$$OD/.$${SAMPLE_ID}_$${TAG}_chimeric_ids.txt
+    samtools view "$$B" \
+      | awk -v hum="$$(paste -sd'|' "$$HUMAN_REFS")" -v hpv="$$(paste -sd'|' "$$HPV_REFS")" '
+          BEGIN{split(hum,h,"|");for(i in h)H[h[i]]=1;split(hpv,p,"|");for(i in p)P[p[i]]=1}
+          {if($$3 in H)sawH[$$1]=1; else if($$3 in P)sawP[$$1]=1}
+          END{for(q in sawH) if(q in sawP) print q}' | sort -u > "$$ids"
+    if [ -s "$$ids" ]; then samtools view -N "$$ids" -bh "$$B" -o "$$C"
+    else samtools view -H "$$B" | samtools view -bh -o "$$C" -; fi
+    samtools index "$$C"
+    log_step "$$TAG chimeric: $$(wc -l < "$$ids") QNAME(s), $$(samtools view -c "$$C") record(s)"
+    rm -f "$$ids"
+
+    # A correct split partitions the BAM exactly, but only once unplaced reads are counted:
+    # a contig-region query cannot return RNAME=*, so the identity is human + HPV + unplaced.
+    local n_all n_h n_p n_u
+    n_all=$$(samtools view -c "$$B"); n_h=$$(samtools view -c "$$H"); n_p=$$(samtools view -c "$$P")
+    n_u=$$(samtools view "$$B" | awk '$$3=="*"{n++} END{print n+0}')
+    if [ "$$(( n_h + n_p + n_u ))" -ne "$$n_all" ]; then
+        log_step "WARNING: $$TAG split does not partition: human $$n_h + hpv $$n_p + unplaced $$n_u != $$n_all (contig lists may not match the reference .fai)"
+    fi
+
+    log_step "Slicing $$TAG human split to $$TARGET_NAME"
+    local G=$$OD/$${SAMPLE_ID}_$${TAG}.human.$${TARGET_NAME}.bam
+    samtools view -bh -L "$$TARGET_BED" "$$H" -o "$$G"; samtools index "$$G"
+}
+
 log_step "Sorting and indexing SSC BAM"
 samtools sort "$$TEMP_SSC_DIR/$${SAMPLE_ID}_umi_deduped.bam" -o "$$SSC_BAM"
 samtools index "$$SSC_BAM"
+split_species "$$SSC_BAM" "$$OUTPUT_SSC_DIR" "SSC"
 
 log_step "Generating SSC coverage"
 samtools coverage "$$SSC_BAM" \
@@ -973,6 +1061,7 @@ gatk --java-options "$$JVM_OPTIONS" MergeBamAlignment \
 log_step "Sorting and indexing DSC BAM"
 samtools sort "$$TEMP_DSC_DIR/$${SAMPLE_ID}_umi_deduped.bam" -o "$$OUTPUT_DSC_DIR/$${SAMPLE_ID}_umi_dedup_sorted_DSC.bam"
 samtools index "$$OUTPUT_DSC_DIR/$${SAMPLE_ID}_umi_dedup_sorted_DSC.bam"
+split_species "$$OUTPUT_DSC_DIR/$${SAMPLE_ID}_umi_dedup_sorted_DSC.bam" "$$OUTPUT_DSC_DIR" "DSC"
 
 log_step "Generating DSC coverage"
 samtools coverage "$$OUTPUT_DSC_DIR/$${SAMPLE_ID}_umi_dedup_sorted_DSC.bam" \
@@ -1053,6 +1142,12 @@ log_step "SSC/DSC analysis complete"
         "ssc_family_size_tag_quoted": shell_quote(args.ssc_family_size_tag),
         "umi_whitelist_ssc_block": umi_whitelist_ssc_block,
         "umi_whitelist_dsc_block": umi_whitelist_dsc_block,
+        "min_read_length": str(args.min_read_length),
+        "do_species_split": "0" if args.skip_species_split else "1",
+        "human_refs": shell_quote(args.human_refs),
+        "hpv_refs": shell_quote(args.hpv_refs),
+        "target_bed": shell_quote(args.target_bed),
+        "target_name": shell_quote(args.target_name),
     }
     return template.substitute(substitutions)
 

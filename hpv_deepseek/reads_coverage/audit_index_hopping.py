@@ -44,6 +44,8 @@ from pathlib import Path
 import pysam
 
 DEFAULT_MIN_FLOOR = 10
+DEFAULT_HOP_RATE = 0.005    
+DEFAULT_HOP_MARGIN = 2      # require this multiple of the expected hop load to rescue
 DEFAULT_SNR_THRESHOLD = 0.01
 JOINABLE_STATUSES = ("exact", "near")
 
@@ -71,6 +73,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bam-kind", required=True, choices=("SSC", "DSC"), help="Which BAM tier to audit.")
     parser.add_argument("--output-dir", required=True, help="Directory for clean BAMs and the final report.")
     parser.add_argument("--min-floor", type=int, default=DEFAULT_MIN_FLOOR, help=f"Minimum genotype read total below which a non-source sample's reads are always blacklisted. Default: {DEFAULT_MIN_FLOOR}.")
+    parser.add_argument("--hop-rate", type=float, default=DEFAULT_HOP_RATE, help=f"Assumed index-hopping rate. With --hop-margin this sets the rescue bar at what hopping could physically deliver: expected_hops = hop_rate * source_load / (n_samples - 1). Default: {DEFAULT_HOP_RATE}.")
+    parser.add_argument("--hop-margin", type=float, default=DEFAULT_HOP_MARGIN, help=f"Rescue a non-source sample whose load is at least this multiple of expected_hops. Default: {DEFAULT_HOP_MARGIN}.")
     parser.add_argument(
         "--snr-threshold",
         type=float,
@@ -131,10 +135,15 @@ def run_floor_snr_audit(
     totals: dict[tuple[str, str], int],
     min_floor: int,
     snr_threshold: float,
+    hop_rate: float = DEFAULT_HOP_RATE,
+    hop_margin: float = DEFAULT_HOP_MARGIN,
+    n_samples: int | None = None,
 ) -> tuple[dict[str, set], dict[str, dict], dict[str, Counter]]:
     """Group rows by (signature, canonical UMI) across all samples; for every group spanning
     more than one sample, the sample with the highest genotype (contig) read total is treated
-    as the source, and every other sample's reads in the group are floor/SNR-audited. Returns
+    as the source, and every other sample's reads in the group are audited against three
+    tests in order: below --min-floor is always blacklisted; at or above the hop expectation
+    is rescued; at or above the legacy SNR ratio is rescued; otherwise blacklisted. Returns
     (blacklist, stats, leaked_source_votes): blacklist maps sample_id -> set of blacklisted
     read names; stats maps sample_id -> {"phase1_suspicious", "phase2_rescued",
     "phase2_confirmed_bad"} counts; leaked_source_votes maps sample_id -> Counter of which
@@ -142,6 +151,8 @@ def run_floor_snr_audit(
     groups: dict[tuple, list[dict]] = defaultdict(list)
     for row in rows:
         groups[signature_key(row)].append(row)
+    if n_samples is None:
+        n_samples = len({row["sample_id"] for row in rows})
 
     blacklist: dict[str, set] = defaultdict(set)
     stats: dict[str, dict] = defaultdict(lambda: {"phase1_suspicious": 0, "phase2_rescued": 0, "phase2_confirmed_bad": 0})
@@ -163,12 +174,26 @@ def run_floor_snr_audit(
             stats[sample_id]["phase1_suspicious"] += 1
             patient_total = totals.get((sample_id, contig), 0)
             ratio = patient_total / winning_total if winning_total > 0 else 0.0
-            if patient_total < min_floor or ratio < snr_threshold:
+            #     expected_hops = hop_rate * source_load / (n_samples - 1)
+            #     rescue if patient_load >= hop_margin * expected_hops
+            expected_hops = (hop_rate * winning_total / max(n_samples - 1, 1)) if n_samples else 0.0
+            need = hop_margin * expected_hops
+            if patient_total < min_floor:
+                rescued, why = False, "below_min_floor"
+            elif patient_total >= need:
+                rescued, why = True, "above_hop_expectation"
+            elif ratio >= snr_threshold:
+                rescued, why = True, "legacy_snr_ratio"
+            else:
+                rescued, why = False, "deleted_hop_signature"
+            if not rescued:
                 blacklist[sample_id].add(row["read_name"])
                 stats[sample_id]["phase2_confirmed_bad"] += 1
+                stats[sample_id].setdefault("reasons", Counter())[why] += 1
                 leaked_source_votes[sample_id][winning_sample] += 1
             else:
                 stats[sample_id]["phase2_rescued"] += 1
+                stats[sample_id].setdefault("reasons", Counter())[why] += 1
 
     return blacklist, stats, leaked_source_votes
 
@@ -227,7 +252,9 @@ def main() -> None:
         return
 
     totals = compute_genotype_totals(all_rows)
-    blacklist, stats, leaked_source_votes = run_floor_snr_audit(all_rows, totals, args.min_floor, args.snr_threshold)
+    blacklist, stats, leaked_source_votes = run_floor_snr_audit(
+        all_rows, totals, args.min_floor, args.snr_threshold,
+        hop_rate=args.hop_rate, hop_margin=args.hop_margin)
 
     umi_matched_reads = defaultdict(int)
     for row in all_rows:

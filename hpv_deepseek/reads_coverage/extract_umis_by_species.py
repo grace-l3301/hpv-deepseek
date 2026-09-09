@@ -27,7 +27,8 @@ from pathlib import Path
 
 import pysam
 
-from umi_matching import DEFAULT_MAX_EDIT_DISTANCE, UNCLASSIFIED, UmiMatch, load_umi_catalogs, match_umi
+from umi_matching import (DEFAULT_MAX_EDIT_DISTANCE, OVERHANG_BASE, UNCLASSIFIED,
+                          UmiMatch, load_umi_catalogs, match_umi_with_overhang)
 
 DEFAULT_THREE_NT_TRIM_LENGTH = 4  # 3-nt UMI + 1-base T-overhang; no padding assumed
 DEFAULT_FIVE_NT_TRIM_LENGTH = 6  # 5-nt UMI + 1-base T-overhang
@@ -60,16 +61,32 @@ def classify_leading_sequence(
         if prefix5 in five_nt_catalog:
             return UmiMatch("5nt", prefix5, 0)
 
-    match3 = match_umi(prefix3, three_nt_catalog, max_edit_distance)
-    if match3.accepted:
-        return UmiMatch("3nt", match3.umi, match3.edit_distance)
+    # Needs one base beyond the UMI, so a read too short to carry it cannot be fuzzy-matched at that length.
+    if len(seq) >= 4:
+        match3 = match_umi_with_overhang(seq, three_nt_catalog, max_edit_distance)
+        if match3.accepted:
+            return UmiMatch("3nt", match3.umi, match3.edit_distance)
 
-    if len(seq) >= 5:
-        match5 = match_umi(seq[:5], five_nt_catalog, max_edit_distance)
+    if len(seq) >= 6:
+        match5 = match_umi_with_overhang(seq, five_nt_catalog, max_edit_distance)
         if match5.accepted:
             return UmiMatch("5nt", match5.umi, match5.edit_distance)
 
     return UNCLASSIFIED
+
+
+def apply_umi_correction(read, match: UmiMatch) -> bool:
+    """Rewrite leading UMI+overhang in place to the matched catalog entry."""
+    if match.umi is None or match.species == UNCLASSIFIED.species:
+        return False
+    entry = match.umi + OVERHANG_BASE
+    seq = read.query_sequence
+    if seq is None or len(seq) < len(entry) or seq[:len(entry)] == entry:
+        return False
+    qual = read.query_qualities            # save: the next line discards it
+    read.query_sequence = entry + seq[len(entry):]
+    read.query_qualities = qual            # restore
+    return True
 
 
 def classify_pair(r1_match: UmiMatch, r2_match: UmiMatch) -> str:
@@ -141,10 +158,13 @@ def split_bam_into_buckets(
     max_edit_distance: int,
 ) -> tuple[dict, dict]:
     """Classify every pair in input_bam and write it to its bucket's BAM under work_dir.
-    Returns (counts, bucket_paths): counts maps every bucket in ALL_BUCKETS to its pair
-    count (0 if empty); bucket_paths maps only non-empty buckets to their Path."""
+    Returns (counts, bucket_paths, corrected): counts maps every bucket in ALL_BUCKETS to
+    its pair count (0 if empty) and NOTHING else, because the caller sums its values to get
+    the pair total; bucket_paths maps only non-empty buckets to their Path; corrected is the
+    number of reads whose UMI bases were rewritten."""
     header = read_bam_header(input_bam)
     counts = {bucket: 0 for bucket in ALL_BUCKETS}
+    corrected = 0
     writers: dict[str, pysam.AlignmentFile] = {}
     bucket_paths: dict[str, Path] = {}
 
@@ -154,6 +174,14 @@ def split_bam_into_buckets(
             r2_match = classify_leading_sequence(r2.query_sequence, three_nt_catalog, five_nt_catalog, max_edit_distance)
             bucket = classify_pair(r1_match, r2_match)
             counts[bucket] += 1
+
+            # Correct the UMI bases before extraction, so a 1-error UMI joins its true family instead of forming a singleton.
+            if bucket != REJECT_BUCKET:
+                # Tallied separately, NOT into `counts`: the caller reports
+                # sum(counts.values()) as the pair total, so an extra key there would
+                # silently inflate it by the correction count (~2% of reads).
+                corrected += int(apply_umi_correction(r1, r1_match))
+                corrected += int(apply_umi_correction(r2, r2_match))
 
             if bucket not in writers:
                 bucket_path = work_dir / f"{sample_id}_unmapped_bucket_{bucket}.bam"
@@ -166,7 +194,7 @@ def split_bam_into_buckets(
         for writer in writers.values():
             writer.close()
 
-    return counts, bucket_paths
+    return counts, bucket_paths, corrected
 
 
 def run_extract_umis(
@@ -267,7 +295,7 @@ def main() -> None:
 
     three_nt_catalog, five_nt_catalog = load_umi_catalogs(catalog_path)
 
-    counts, bucket_paths = split_bam_into_buckets(
+    counts, bucket_paths, corrected = split_bam_into_buckets(
         input_bam, work_dir, args.sample_id, three_nt_catalog, five_nt_catalog, args.max_edit_distance
     )
 
@@ -294,6 +322,8 @@ def main() -> None:
     for bucket in ALL_BUCKETS:
         print(f"  {bucket}: {counts[bucket]} read pair(s)")
     print(f"  total: {total} read pair(s)")
+    print(f"  UMI bases corrected: {corrected} read(s)"
+          f"{f' ({100 * corrected / (2 * total):.2f}% of reads)' if total else ''}")
 
 
 if __name__ == "__main__":
