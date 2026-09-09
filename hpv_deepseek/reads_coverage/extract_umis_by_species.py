@@ -156,7 +156,7 @@ def split_bam_into_buckets(
     three_nt_catalog: frozenset[str],
     five_nt_catalog: frozenset[str],
     max_edit_distance: int,
-) -> tuple[dict, dict]:
+) -> tuple[dict, dict, int]:
     """Classify every pair in input_bam and write it to its bucket's BAM under work_dir.
     Returns (counts, bucket_paths, corrected): counts maps every bucket in ALL_BUCKETS to
     its pair count (0 if empty) and NOTHING else, because the caller sums its values to get

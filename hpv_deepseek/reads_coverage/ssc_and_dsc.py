@@ -910,11 +910,7 @@ gatk --java-options "$$JVM_OPTIONS" MergeBamAlignment \
     --ALIGNER_PROPER_PAIR_FLAGS true \
     --CLIP_OVERLAPPING_READS false
 
-# Split a coordinate-sorted BAM into human / HPV / chimeric, then slice the human part
-# to the panel. "chimeric" is per-QNAME, not per-record: keep a QNAME only if it has at
-# least one alignment on a human contig AND at least one on an HPV contig, which is the
-# integration signature. Taking `uniq -d` on QNAME alone flags every read pair, since all
-# data is paired-end, and returns essentially the whole BAM.
+# Split a coordinate-sorted BAM into human / HPV / chimeric
 split_species(){
     local B=$$1 OD=$$2 TAG=$$3
     [ "$$DO_SPECIES_SPLIT" = "1" ] || return 0
@@ -941,8 +937,6 @@ split_species(){
     log_step "$$TAG chimeric: $$(wc -l < "$$ids") QNAME(s), $$(samtools view -c "$$C") record(s)"
     rm -f "$$ids"
 
-    # A correct split partitions the BAM exactly, but only once unplaced reads are counted:
-    # a contig-region query cannot return RNAME=*, so the identity is human + HPV + unplaced.
     local n_all n_h n_p n_u
     n_all=$$(samtools view -c "$$B"); n_h=$$(samtools view -c "$$H"); n_p=$$(samtools view -c "$$P")
     n_u=$$(samtools view "$$B" | awk '$$3=="*"{n++} END{print n+0}')
